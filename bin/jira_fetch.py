@@ -15,6 +15,8 @@ import base64
 import json
 import os
 import re
+import ssl
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -112,9 +114,37 @@ def parse_target(arg, base=DEFAULT_BASE):
     return base, key.group(1)
 
 
+_SSL = None
+
+
+def ssl_context():
+    """python.org 설치판 Python 은 macOS 인증서 저장소를 쓰지 않아 CERTIFICATE_VERIFY_FAILED 가 난다.
+    기본 저장소에 macOS 키체인 루트(회사 프록시 인증서 포함)와 certifi(있으면)를 더한다."""
+    global _SSL
+    if _SSL is None:
+        ctx = ssl.create_default_context()
+        try:
+            import certifi
+            ctx.load_verify_locations(certifi.where())
+        except Exception:
+            pass
+        if sys.platform == "darwin":
+            for chain in ("/System/Library/Keychains/SystemRootCertificates.keychain",
+                          "/Library/Keychains/System.keychain"):
+                try:
+                    pem = subprocess.run(["/usr/bin/security", "find-certificate", "-a", "-p", chain],
+                                         capture_output=True, text=True, timeout=20).stdout
+                    if "BEGIN CERTIFICATE" in pem:
+                        ctx.load_verify_locations(cadata=pem)
+                except Exception:
+                    pass
+        _SSL = ctx
+    return _SSL
+
+
 def request(url, auth, raw=False):
     req = urllib.request.Request(url, headers={"Authorization": auth, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as res:
+    with urllib.request.urlopen(req, timeout=30, context=ssl_context()) as res:
         data = res.read()
     return data if raw else json.loads(data)
 
