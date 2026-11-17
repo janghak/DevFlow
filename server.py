@@ -50,8 +50,13 @@ WORKLOG = os.path.join(DATA, "worklog")
 RUNS = os.path.join(DATA, "runs")
 SUGGESTIONS = os.path.join(DATA, "suggestions.json")
 INDEX = os.path.join(ROOT, "web", "index.html")
-SKILL = os.path.expanduser("~/.claude/skills/suggest/SKILL.md")
-JIRA_SKILL = os.path.expanduser("~/.claude/skills/jira/SKILL.md")
+# 규칙 문서는 저장소 안 skills/ 에 둔다 ({{DEVFLOW}} 는 이 폴더 경로로 바뀜). install.py 가 같은 내용을 ~/.claude/skills 에 설치한다
+SKILL = os.path.join(ROOT, "skills", "suggest", "SKILL.md")
+JIRA_SKILL = os.path.join(ROOT, "skills", "jira", "SKILL.md")
+
+
+def skill_rules(path):
+    return open(path, encoding="utf-8").read().split("---", 2)[-1].replace("{{DEVFLOW}}", ROOT)
 WORK_TIMEOUT_SEC = 60 * 60
 WORK_BUDGET_USD = "20"  # 1회 작업 비용 상한
 
@@ -71,7 +76,7 @@ def load_project():
 REPO, WORK_REPO = load_project()
 
 STATUSES = {"proposed", "accepted", "rejected", "ticketed", "in_progress", "done"}
-DEFAULT_CATEGORIES = ["UI 전환", "아키텍처", "모듈·빌드", "안정성·크래시", "성능", "deprecated API", "접근성", "코드 정리"]
+DEFAULT_CATEGORIES = jf.DEFAULT_CATEGORIES
 
 
 def categories():
@@ -304,7 +309,7 @@ def suggest_schema():
 
 
 def build_prompt(scope, existing):
-    rules = open(SKILL, encoding="utf-8").read().split("---", 2)[-1]
+    rules = skill_rules(SKILL)
     known = "\n".join(f"- {i.get('title')} ({', '.join(e.get('file', '') + ':' + str(e.get('line', '')) for e in i.get('evidence', []))})"
                       for i in existing) or "(없음)"
     return (
@@ -485,7 +490,7 @@ def analysis_path(key):
 
 
 def work_prompt(url, key):
-    rules = (open(JIRA_SKILL, encoding="utf-8").read().split("---", 2)[-1].replace("$ARGUMENTS", url)
+    rules = (skill_rules(JIRA_SKILL).replace("$ARGUMENTS", url)
              .replace(f"`{REPO}`", f"`{WORK_REPO}`"))
     prior = analysis_path(key)
     return (
@@ -494,7 +499,8 @@ def work_prompt(url, key):
         "코드를 바꾸지 말고 이유와 필요한 결정을 적고 끝낸다. 작업 기록이 있으면 status 를 'blocked' 로, note 에 이유를 남긴다.\n"
         "- 6단계(커밋·푸시·PR)는 절대 하지 않는다. 해당 명령은 권한에서도 막혀 있다.\n"
         f"- 브랜치 이름은 {branch_prefix()}{key} 이고 기준은 {base_ref()} 다 (규칙 문서의 브랜치명보다 이 값이 우선).\n"
-        f"- 작업 저장소는 devflow 전용 폴더 {WORK_REPO} 이다. 사용자의 개발 폴더 {REPO} 는 읽지도 수정하지도 않는다.\n"
+        + (f"- 빌드 확인 명령: {build_cmd()} (작업 폴더에서 실행)\n" if build_cmd() else "- 빌드 확인 명령이 설정돼 있지 않다. ./gradlew 계열이면 가장 가벼운 컴파일 태스크를 실행하고, 아니면 빌드 확인은 미검증으로 남긴다.\n")
+        + f"- 작업 저장소는 devflow 전용 폴더 {WORK_REPO} 이다. 사용자의 개발 폴더 {REPO} 는 읽지도 수정하지도 않는다.\n"
         "- 브랜치가 사용자의 개발 폴더에서 체크아웃돼 있어 전환이 안 되면(already used by worktree), 아무것도 바꾸지 말고 "
         "'개발 폴더에서 다른 브랜치로 옮긴 뒤 다시 실행' 하라고 적고 끝낸다.\n"
         + (f"- 이전 분석 결과가 있다: {prior} 를 먼저 읽고 참고한다 (그대로 믿지 말고 코드로 확인).\n" if os.path.exists(prior) else "")
@@ -523,7 +529,7 @@ def describe_step(name, inp):
     if name == "Bash":
         if "jira_fetch.py" in cmd:
             return "티켓 읽기", "Jira 티켓 내용 가져오기"
-        if "gradlew" in cmd:
+        if "gradlew" in cmd or (build_cmd() and cmd.startswith(build_cmd())):
             return "빌드 확인", "gradle 컴파일 (몇 분 걸릴 수 있음)"
         if cmd.startswith(("git fetch", "git switch", "git branch", "git rev-parse", "git ls-remote")):
             return "브랜치 준비", cmd[:100]
@@ -559,7 +565,7 @@ def run_job(job):
         prompt = analyze_prompt(url, key) if analyze else work_prompt(url, key)
         claude = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
         cmd = [claude, "-p", prompt, "--output-format", "stream-json", "--verbose",
-               "--allowedTools", *(ANALYZE_ALLOWED if analyze else WORK_ALLOWED),
+               "--allowedTools", *(ANALYZE_ALLOWED if analyze else work_allowed()),
                "--disallowedTools", *(ANALYZE_DENIED if analyze else WORK_DENIED),
                "--add-dir", ROOT, "--max-budget-usd", ANALYZE_BUDGET_USD if analyze else WORK_BUDGET_USD,
                "--max-turns", "200"]
@@ -958,7 +964,21 @@ REF_RE = re.compile(r"[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*")
 def base_ref():
     """새 티켓 브랜치를 딸 기준 (예: origin/develop). 설정 탭에서 지정."""
     r = jf.load_config()["DEVFLOW_BASE_REF"]
-    return r if r and REF_RE.fullmatch(r) and ".." not in r else "origin/main"
+    return r if r and REF_RE.fullmatch(r) and ".." not in r else jf.DEFAULT_BASE_REF
+
+
+BUILD_CMD_RE = re.compile(r"[A-Za-z0-9 ._:/=+-]{1,200}")
+PR_URL_RE = re.compile(r"https://[^\s]{4,300}")
+
+
+def build_cmd():
+    c = jf.load_config()["DEVFLOW_BUILD_CMD"].strip()
+    return c if BUILD_CMD_RE.fullmatch(c or "") else ""
+
+
+def work_allowed():
+    # 설정한 빌드 확인 명령만 추가로 허용한다 (셸 연결 기호가 들어갈 수 없게 형식을 검사함)
+    return WORK_ALLOWED + ([f"Bash({build_cmd()}:*)"] if build_cmd() else [])
 DIFF_LIMIT = 200_000
 
 
@@ -1047,13 +1067,22 @@ def anything_running():
         return work_state.get("status") == "running" or bool(job_queue) or run_state.get("status") == "running"
 
 
+def setup_state():
+    """처음 설정 안내용: Jira 연결과 소스 프로젝트 준비 여부."""
+    cfg = jf.load_config()
+    return {"jira": bool(cfg["JIRA_EMAIL"] and cfg["JIRA_API_TOKEN"] and cfg["JIRA_BASE_URL"]),
+            "project": bool(REPO) and is_worktree_of(WORK_REPO, REPO)}
+
+
 def project_status():
     repo_ok = bool(REPO) and is_main_repo(REPO) and repo_root(REPO) == os.path.realpath(REPO)
     return {"repo": REPO, "workRepo": WORK_REPO, "baseRef": base_ref(), "repoOk": repo_ok,
             "baseOk": repo_ok and git_at(REPO, "rev-parse", "--verify", "--quiet", base_ref()).returncode == 0,
             "workReady": repo_ok and is_worktree_of(WORK_REPO, REPO),
             "branch": git_at(REPO, "branch", "--show-current").stdout.strip() if repo_ok else "",
-            "branchPrefix": branch_prefix(), "categories": ", ".join(categories())}
+            "branchPrefix": branch_prefix(), "categories": ", ".join(categories()),
+            "buildCmd": build_cmd(), "commitTemplate": jf.public_config()["commitTemplate"],
+            "prUrl": jf.load_config()["DEVFLOW_PR_URL"]}
 
 
 def find_candidates():
@@ -1122,11 +1151,21 @@ def save_project(body):
     cats = [c.strip() for c in str(body.get("categories") or "").split(",") if c.strip()] or categories()
     if len(cats) > 15 or any(len(c) > 30 or "\n" in c for c in cats):
         return 400, {"error": "카테고리는 쉼표로 구분해 15개까지, 각 30자 이내입니다"}
+    build = str(body.get("buildCmd") or "").strip()
+    if build and not BUILD_CMD_RE.fullmatch(build):
+        return 400, {"error": "빌드 확인 명령에는 영문·숫자·공백과 ._:/=+- 만 쓸 수 있습니다 (예: ./gradlew :app:compileDebugKotlin -q)"}
+    pr = str(body.get("prUrl") or "").strip()
+    if pr and not PR_URL_RE.fullmatch(pr):
+        return 400, {"error": "PR 주소 형식은 https:// 로 시작해야 합니다 (예: https://github.com/org/repo/compare/{base}...{branch}?expand=1)"}
+    template = str(body.get("commitTemplate") or "").replace("\r", "").strip()
+    if len(template) > 1000:
+        return 400, {"error": "커밋 메시지 형식은 1000자 이내입니다"}
     work = repo + "-devflow"  # 전용 작업 폴더는 사용자가 정하지 않고 소스 폴더 옆에 자동으로 둔다
     if os.path.exists(work) and not is_worktree_of(work, repo) and (not os.path.isdir(work) or os.listdir(work)):
         return 400, {"error": f"{work} 에 다른 파일이 있어 전용 작업 폴더를 만들 수 없습니다. 그 폴더를 옮기거나 이름을 바꾼 뒤 다시 저장하세요"}
     jf.write_env({"DEVFLOW_REPO": repo, "DEVFLOW_WORK_REPO": work, "DEVFLOW_BRANCH_PREFIX": prefix,
-                  "DEVFLOW_BASE_REF": ref, "DEVFLOW_CATEGORIES": ",".join(cats)})
+                  "DEVFLOW_BASE_REF": ref, "DEVFLOW_CATEGORIES": ",".join(cats), "DEVFLOW_BUILD_CMD": build,
+                  "DEVFLOW_PR_URL": pr, "DEVFLOW_COMMIT_TEMPLATE": template.replace("\n", "\\n")})
     if (REPO, WORK_REPO) != (repo, work):
         devflow_untracked.clear()
     REPO, WORK_REPO = repo, work
@@ -1218,6 +1257,7 @@ class Handler(BaseHTTPRequestHandler):
                 "suggestions": read_json(SUGGESTIONS, {"items": []}).get("items", []),
                 "categories": categories(),
                 "jiraBase": jf.load_config()["JIRA_BASE_URL"],
+                "setup": setup_state(),
             })
         if self.path == "/api/jira":
             return self.send(200, jira_settings())

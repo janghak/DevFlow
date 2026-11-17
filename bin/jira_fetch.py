@@ -3,6 +3,7 @@
 
 사용:
   python3 -I bin/jira_fetch.py <URL 또는 KEY> [--attachments DIR]
+  python3 -I bin/jira_fetch.py --config      스킬이 쓰는 설정 JSON (토큰 제외)
   python3 -I bin/jira_fetch.py --repo        설정된 소스 폴더, 전용 작업 폴더, 브랜치 접두어를 한 줄씩 출력
   python3 -I bin/jira_fetch.py --selftest
 
@@ -24,7 +25,24 @@ KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
 BASE_RE = re.compile(r"https://[a-z0-9-]+\.atlassian\.net")
 ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
 ENV_KEYS = ("JIRA_EMAIL", "JIRA_API_TOKEN", "JIRA_BASE_URL", "JIRA_PROJECTS", "DEVFLOW_REPO", "DEVFLOW_WORK_REPO", "DEVFLOW_ENGINE", "DEVFLOW_BRANCH_PREFIX",
-            "DEVFLOW_BASE_REF", "DEVFLOW_CATEGORIES", "JIRA_HIGHLIGHT")
+            "DEVFLOW_BASE_REF", "DEVFLOW_CATEGORIES", "JIRA_HIGHLIGHT",
+            "DEVFLOW_BUILD_CMD", "DEVFLOW_COMMIT_TEMPLATE", "DEVFLOW_PR_URL")
+DEFAULT_BASE_REF = "origin/main"
+DEFAULT_CATEGORIES = ["UI 전환", "아키텍처", "모듈·빌드", "안정성·크래시", "성능", "deprecated API", "접근성", "코드 정리"]
+
+
+def public_config():
+    """스킬이 읽는 설정 (Jira 이메일·토큰은 빼고). 커밋 형식의 줄바꿈은 .env 에 \\n 으로 저장돼 있다."""
+    cfg = load_config()
+    repo = cfg["DEVFLOW_REPO"]
+    cats = [c.strip() for c in cfg["DEVFLOW_CATEGORIES"].split(",") if c.strip()]
+    return {"repo": repo, "workRepo": cfg["DEVFLOW_WORK_REPO"] or (repo + "-devflow" if repo else ""),
+            "branchPrefix": cfg["DEVFLOW_BRANCH_PREFIX"] or DEFAULT_BRANCH_PREFIX,
+            "baseRef": cfg["DEVFLOW_BASE_REF"] or DEFAULT_BASE_REF,
+            "buildCmd": cfg["DEVFLOW_BUILD_CMD"],
+            "commitTemplate": cfg["DEVFLOW_COMMIT_TEMPLATE"].replace("\\n", "\n"),
+            "prUrl": cfg["DEVFLOW_PR_URL"], "jiraBase": cfg["JIRA_BASE_URL"],
+            "categories": cats or DEFAULT_CATEGORIES}
 DEFAULT_BRANCH_PREFIX = "feature/"
 FIELDS = ",".join([
     "summary", "status", "issuetype", "priority", "assignee", "reporter", "labels",
@@ -247,6 +265,9 @@ def main():
     args = sys.argv[1:]
     if args == ["--selftest"]:
         return selftest()
+    if args == ["--config"]:
+        print(json.dumps(public_config(), ensure_ascii=False, indent=2))
+        return
     if args == ["--repo"]:
         cfg = load_config()
         if not cfg["DEVFLOW_REPO"]:

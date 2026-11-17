@@ -604,6 +604,13 @@ async function renderProject(state) {
         <div class="meta">티켓 브랜치 이름: <code>${esc(p.branchPrefix || "feature/")}PROJ-1234</code></div></dd>
       <dt><label for="p-base">기준 브랜치</label></dt>
       <dd><input id="p-base" style="width:100%" placeholder="origin/develop" value="${esc(p.baseRef)}"></dd>
+      <dt><label for="p-build">빌드 확인 명령</label></dt>
+      <dd><input id="p-build" style="width:100%" placeholder="예: ./gradlew :app:compileDebugKotlin -q (비우면 작업 때 자동 판단)" value="${esc(p.buildCmd)}"></dd>
+      <dt><label for="p-commit">커밋 메시지 형식</label></dt>
+      <dd><textarea id="p-commit" rows="4" style="width:100%;font:12px/1.4 ui-monospace,Menlo,monospace;border:1px solid var(--line);border-radius:8px;padding:6px 10px;background:var(--surface);color:var(--text)" placeholder="{type}: {title} ({key})&#10;&#10;{changes}">${esc(p.commitTemplate)}</textarea>
+        <div class="meta">쓸 수 있는 값: {title} {key} {url} {type} {changes} · 비우면 위 기본 형식</div></dd>
+      <dt><label for="p-pr">PR 주소 형식</label></dt>
+      <dd><input id="p-pr" style="width:100%" placeholder="https://github.com/org/repo/compare/{base}...{branch}?expand=1" value="${esc(p.prUrl)}"></dd>
       <dt><label for="p-cats">제안 카테고리</label></dt>
       <dd><input id="p-cats" style="width:100%" placeholder="쉼표로 구분" value="${esc(p.categories)}"></dd>
       <dt>전용 작업 폴더</dt>
@@ -711,7 +718,19 @@ app.addEventListener("submit", async e => {
 
 function render() {
   document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b.dataset.tab === tab));
-  ({ today: renderToday, suggest: renderSuggest, jira: renderJira, work: renderWork, settings: renderSettings })[tab]();
+  const r = ({ today: renderToday, suggest: renderSuggest, jira: renderJira, work: renderWork, settings: renderSettings })[tab]();
+  Promise.resolve(r).then(setupBanner);
+}
+
+// 처음 받은 사람이 설정 탭부터 채우도록 안내
+function setupBanner() {
+  const s = data.setup;
+  if (!s || (s.jira && s.project) || tab === "settings" || document.getElementById("setup-banner")) return;
+  const todo = [!s.jira && "Jira 연결(이메일·토큰·주소)", !s.project && "소스 프로젝트(소스 폴더 선택·저장)"].filter(Boolean);
+  app.insertAdjacentHTML("afterbegin", `<section class="card" id="setup-banner" style="border-color:var(--warn);background:var(--warn-soft)">
+    <b>처음 설정이 필요합니다</b>
+    <p style="margin:6px 0">설정 탭에서 ${todo.map(esc).join(", ")} 을(를) 먼저 채워 주세요. 회사·개인 정보는 이 PC 의 devflow/.env 에만 저장됩니다.</p>
+    <button class="btn primary" data-goto="settings">설정 탭으로</button></section>`);
 }
 
 document.querySelector("nav").addEventListener("click", e => {
@@ -725,6 +744,8 @@ document.getElementById("diff-dialog").addEventListener("click", e => { if (e.ta
 
 app.addEventListener("click", async e => {
   if (e.target.id === "print") return window.print();
+  const go = e.target.closest("[data-goto]");
+  if (go) { tab = go.dataset.goto; history.replaceState(null, "", `#${tab}`); return render(); }
   if (e.target.id === "run-start") return startRun();
   if (e.target.id === "jira-refresh") return renderJira(true);
   if (e.target.id === "auto-check") { e.target.disabled = true; return autoCall("/api/auto/check"); }
@@ -743,7 +764,9 @@ app.addEventListener("click", async e => {
     setPanel(`<p class="meta">전용 작업 폴더를 준비하는 중… (처음 만들 때는 1분 이상 걸릴 수 있어요)</p>`);
     const r = btn.id === "p-save"
       ? await projectCall("/api/project", { repo: document.getElementById("p-repo").value.trim(), branchPrefix: document.getElementById("p-prefix").value.trim(),
-          baseRef: document.getElementById("p-base").value.trim(), categories: document.getElementById("p-cats").value.trim() })
+          baseRef: document.getElementById("p-base").value.trim(), categories: document.getElementById("p-cats").value.trim(),
+          buildCmd: document.getElementById("p-build").value.trim(), commitTemplate: document.getElementById("p-commit").value,
+          prUrl: document.getElementById("p-pr").value.trim() })
       : await projectCall("/api/project/setup", {});
     btn.disabled = false;
     if (!r) return setPanel("");
