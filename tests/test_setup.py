@@ -31,19 +31,20 @@ class InstallTest(unittest.TestCase):
 
 
 class ConfigTest(unittest.TestCase):
-    def test_config_excludes_credentials(self):
+    def test_config_excludes_credentials_and_decodes_template(self):
         with tempfile.TemporaryDirectory() as d:
             old = jf.ENV_PATH
             jf.ENV_PATH = os.path.join(d, ".env")
             try:
-                jf.write_env({"JIRA_EMAIL": "a@b.c", "JIRA_API_TOKEN": "secret-token-123", "DEVFLOW_BUILD_CMD": "make check"})
+                jf.write_env({"JIRA_EMAIL": "a@b.c", "JIRA_API_TOKEN": "secret-token-123",
+                              "DEVFLOW_COMMIT_TEMPLATE": "{type}: {title}\\n\\n{changes}"})
                 cfg = jf.public_config()
             finally:
                 jf.ENV_PATH = old
             dumped = json.dumps(cfg)
             self.assertNotIn("secret-token-123", dumped)
             self.assertNotIn("a@b.c", dumped)
-            self.assertEqual(cfg["buildCmd"], "make check")
+            self.assertEqual(cfg["commitTemplate"], "{type}: {title}\n\n{changes}")
             self.assertEqual(cfg["baseRef"], jf.DEFAULT_BASE_REF)
 
 

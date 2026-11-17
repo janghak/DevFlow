@@ -27,6 +27,9 @@
 - POST /api/project/pick       {"start"?} Finder 폴더 선택 창을 띄워 고른 경로를 돌려준다 (macOS)
 - POST /api/project/plan       전용 작업 폴더 만들기 계획 (하위 저장소, 복사할 git 제외 파일)
 - POST /api/project/setup      {"copy"?: [...]} 전용 작업 폴더 만들기·점검 (copy 없으면 후보 파일 전부)
+- POST /api/commit/preview     {"key"} 커밋할 파일·메시지 초안 (사용자 확인용)
+- POST /api/commit             {"key", "message", "files", "push"} 사용자가 누른 경우에만 커밋(+푸시), PR 주소 반환
+- POST /api/stash/restore      {"key", "ref"} 보관된 티켓 수정을 작업 폴더로 다시 꺼내기
 - GET  /api/changes/<KEY>      티켓 브랜치의 변경 (커밋된 것 + 현재 작업 트리 + devflow stash)
 """
 import datetime
@@ -1081,7 +1084,8 @@ def project_status():
             "workReady": repo_ok and is_worktree_of(WORK_REPO, REPO),
             "branch": git_at(REPO, "branch", "--show-current").stdout.strip() if repo_ok else "",
             "branchPrefix": branch_prefix(), "categories": ", ".join(categories()),
-            "buildCmd": build_cmd(), "prUrl": jf.load_config()["DEVFLOW_PR_URL"]}
+            "buildCmd": build_cmd(), "commitTemplate": jf.public_config()["commitTemplate"],
+            "prUrl": jf.load_config()["DEVFLOW_PR_URL"]}
 
 
 def find_candidates():
@@ -1156,12 +1160,18 @@ def save_project(body):
     pr = str(body.get("prUrl") or "").strip()
     if pr and not PR_URL_RE.fullmatch(pr):
         return 400, {"error": "PR 주소 형식은 https:// 로 시작해야 합니다 (예: https://github.com/org/repo/compare/{base}...{branch}?expand=1)"}
+    template = str(body.get("commitTemplate") or "").replace("\r", "").strip()
+    if len(template) > 1000:
+        return 400, {"error": "커밋 메시지 형식은 1000자 이내입니다"}
     work = repo + "-devflow"  # 전용 작업 폴더는 사용자가 정하지 않고 소스 폴더 옆에 자동으로 둔다
     if os.path.exists(work) and not is_worktree_of(work, repo) and (not os.path.isdir(work) or os.listdir(work)):
         return 400, {"error": f"{work} 에 다른 파일이 있어 전용 작업 폴더를 만들 수 없습니다. 그 폴더를 옮기거나 이름을 바꾼 뒤 다시 저장하세요"}
+    optional = {"DEVFLOW_BUILD_CMD": ("buildCmd", build), "DEVFLOW_PR_URL": ("prUrl", pr),
+                "DEVFLOW_COMMIT_TEMPLATE": ("commitTemplate", template.replace("\n", "\\n"))}
     jf.write_env({"DEVFLOW_REPO": repo, "DEVFLOW_WORK_REPO": work, "DEVFLOW_BRANCH_PREFIX": prefix,
-                  "DEVFLOW_BASE_REF": ref, "DEVFLOW_CATEGORIES": ",".join(cats), "DEVFLOW_BUILD_CMD": build,
-                  "DEVFLOW_PR_URL": pr})
+                  "DEVFLOW_BASE_REF": ref, "DEVFLOW_CATEGORIES": ",".join(cats),
+                  # 요청에 온 칸만 바꾼다: 빠진 칸 때문에 기존 설정이 지워지지 않게
+                  **{k: v for k, (field, v) in optional.items() if field in body}})
     if (REPO, WORK_REPO) != (repo, work):
         devflow_untracked.clear()
     REPO, WORK_REPO = repo, work
@@ -1227,6 +1237,124 @@ def setup_run(body):
         shutil.copy2(os.path.join(REPO, p), dst)
         log.append(f"복사: {p}")
     return 200, {**project_status(), "log": log}
+
+
+# ---------- 커밋·푸시·PR (대시보드에서 사용자가 버튼으로 요청할 때만) ----------
+# AI 작업은 커밋·푸시를 못 한다. 여기 코드는 사용자가 변경 내용을 보고 직접 누른 경우에만 서버가 git 을 실행한다.
+STASH_REF_RE = re.compile(r"stash@\{\d+\}")
+
+
+def checked_out_branch(key):
+    if not KEY_RE.match(key):
+        return None, (400, {"error": "Jira 키 형식이 아닙니다"})
+    if anything_running():
+        return None, (409, {"error": "작업이 실행 중이거나 대기 중이라 지금은 할 수 없습니다"})
+    branch = branch_prefix() + key
+    if git("branch", "--show-current").stdout.strip() != branch:
+        return None, (400, {"error": "이 티켓 브랜치가 전용 작업 폴더에 꺼내져 있지 않습니다. '작업 폴더로 꺼내기'를 먼저 하세요"})
+    return branch, None
+
+
+def commit_candidates():
+    """커밋할 수 있는 파일: 수정된 추적 파일 + 작업 폴더에 새로 생긴 파일 (작업 폴더에는 사용자 파일이 없다)."""
+    files = [{"path": p, "status": "수정"} for p in git("diff", "--name-only", "HEAD", "--ignore-submodules=all").stdout.splitlines() if p]
+    files += [{"path": p, "status": "새 파일"} for p in git("ls-files", "--others", "--exclude-standard").stdout.splitlines() if p]
+    return files
+
+
+def remote_and_base():
+    remote, _, base = base_ref().partition("/")
+    return remote or "origin", base or base_ref()
+
+
+def pr_url(branch):
+    tpl = jf.load_config()["DEVFLOW_PR_URL"]
+    _, base = remote_and_base()
+    return tpl.replace("{base}", base).replace("{branch}", branch) if tpl else ""
+
+
+def commit_preview(key):
+    branch, err = checked_out_branch(key)
+    if err:
+        return err
+    files = commit_candidates()
+    if not files:
+        return 400, {"error": "커밋할 변경이 없습니다"}
+    wl = read_json(os.path.join(WORKLOG, f"{key}.json"), {})
+    lines = [l.strip(" -•") for l in str(wl.get("change") or "").splitlines() if l.strip(" -•")]
+    lines = lines or [f["path"] for f in files]
+    kind = "fix" if any(str(t).lower() in ("bugfix", "bug") for t in wl.get("tags", [])) else "feat"
+    template = jf.public_config()["commitTemplate"] or "{type}: {title} ({key})\n\n{changes}"
+    message = (template.replace("{title}", str(wl.get("title") or key)).replace("{key}", key)
+               .replace("{url}", f"{jf.load_config()['JIRA_BASE_URL']}/browse/{key}").replace("{type}", kind)
+               .replace("{changes}", "\n".join(f"{i}. {l}" for i, l in enumerate(lines, 1))))
+    remote, _ = remote_and_base()
+    return 200, {"key": key, "branch": branch, "remote": remote, "files": files, "message": message, "prUrl": pr_url(branch)}
+
+
+def commit_run(body):
+    key = str(body.get("key") or "").strip().upper()
+    branch, err = checked_out_branch(key)
+    if err:
+        return err
+    message = str(body.get("message") or "").replace("\r", "").strip()
+    if not message or len(message) > 5000:
+        return 400, {"error": "커밋 메시지를 입력하세요 (5000자 이내)"}
+    allowed = {f["path"] for f in commit_candidates()}
+    files = [p for p in (body.get("files") or []) if p in allowed]  # 목록에 있던 파일만
+    if not files:
+        return 400, {"error": "커밋할 파일을 하나 이상 고르세요"}
+    r = git("add", "-A", "--", *files)
+    if r.returncode != 0:
+        return 500, {"error": f"git add 실패: {r.stderr.strip()[:300]}"}
+    r = subprocess.run(["git", "commit", "-F", "-"], cwd=WORK_REPO, input=message + "\n", capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        git("reset", "-q", "--", *files)  # 스테이징만 되돌린다 (파일 내용은 그대로)
+        return 500, {"error": f"커밋 실패: {(r.stderr or r.stdout).strip()[:500]}"}
+    sha = git("rev-parse", "--short", "HEAD").stdout.strip()
+    devflow_untracked.difference_update(files)
+    result = {"commit": sha, "branch": branch, "pushed": False, "prUrl": ""}
+    wl_path = os.path.join(WORKLOG, f"{key}.json")
+    wl = read_json(wl_path, None)
+    if body.get("push"):
+        remote, _ = remote_and_base()
+        p = subprocess.run(["git", "push", "-u", remote, branch], cwd=WORK_REPO, capture_output=True, text=True,
+                           timeout=300, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+        if p.returncode == 0:
+            result.update(pushed=True, prUrl=pr_url(branch))
+        else:
+            result["pushError"] = (p.stderr or p.stdout).strip()[:500]
+    if isinstance(wl, dict):
+        wl["commits"] = list(wl.get("commits") or []) + [sha]
+        wl["status"] = "pushed" if result["pushed"] else "committed"
+        wl["updatedAt"] = datetime.date.today().isoformat()
+        write_json(wl_path, wl)
+    return 200, result
+
+
+def restore_stash(body):
+    """다음 작업으로 넘어가며 보관된 티켓 수정을 작업 폴더로 다시 꺼낸다 (그 티켓 브랜치로 전환 + stash pop)."""
+    key = str(body.get("key") or "").strip().upper()
+    ref = str(body.get("ref") or "")
+    if not KEY_RE.match(key) or not STASH_REF_RE.fullmatch(ref):
+        return 400, {"error": "잘못된 요청"}
+    if anything_running():
+        return 409, {"error": "작업이 실행 중이거나 대기 중이라 지금은 꺼낼 수 없습니다"}
+    branch = branch_prefix() + key
+    entry = next((l for l in git("stash", "list").stdout.splitlines() if l.startswith(ref + ":")), "")
+    if f"devflow: {branch} (" not in entry:
+        return 400, {"error": "이 티켓의 devflow 보관분이 아닙니다. 새로고침 후 다시 시도하세요"}
+    if git("diff", "--name-only", "HEAD", "--ignore-submodules=all").stdout.strip():
+        return 400, {"error": "작업 폴더에 다른 티켓의 수정이 남아 있습니다. 그 티켓을 먼저 커밋하거나 보관하세요"}
+    before = untracked()
+    r = git("switch", branch)
+    if r.returncode != 0:
+        return 500, {"error": f"브랜치 전환 실패: {r.stderr.strip()[:300]}"}
+    r = git("stash", "pop", ref)
+    if r.returncode != 0:
+        return 500, {"error": f"꺼내기 실패 (충돌일 수 있음): {(r.stderr or r.stdout).strip()[:300]}"}
+    devflow_untracked.update(untracked() - before)
+    return 200, {"branch": branch}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1298,6 +1426,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(*save_project(body))
         if self.path == "/api/engine":
             return self.send(*save_engine(body))
+        if self.path == "/api/commit/preview":
+            return self.send(*commit_preview(str(body.get("key") or "").strip().upper()))
+        if self.path == "/api/commit":
+            return self.send(*commit_run(body))
+        if self.path == "/api/stash/restore":
+            return self.send(*restore_stash(body))
         if self.path == "/api/project/candidates":
             return self.send(*find_candidates())
         if self.path == "/api/project/pick":

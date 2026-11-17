@@ -478,13 +478,69 @@ async function openChanges(key) {
     <p class="meta">브랜치 <code>${esc(c.branch)}</code>${c.current ? " · 지금 체크아웃됨" : ""}${running ? " · 작업 중 (5초마다 갱신)" : ""} · 서브모듈 포인터 제외</p>
     ${!c.exists ? `<p>아직 이 티켓의 브랜치가 없습니다.</p>` : !c.sections.length ? `<p>변경 사항이 없습니다.</p>` : c.sections.map(s => {
       const files = [...s.diff.matchAll(/^diff --git a\/(.+?) b\//gm)].map(m => m[1]);
+      const stashRef = (s.title.match(/stash@\{\d+\}/) || [])[0];
+      const action = stashRef ? `<button class="btn" data-restore="${esc(stashRef)}" ${busy() || jobs.queue.length ? "disabled" : ""}>작업 폴더로 꺼내기</button>`
+        : s.title.startsWith("커밋 안 된") ? `<button class="btn primary" data-commit="${esc(key)}" ${busy() || jobs.queue.length ? "disabled" : ""}>커밋·푸시·PR…</button>` : "";
       return `<section style="margin-top:14px">
-        <h4 style="margin:0 0 4px">${esc(s.title)} · 파일 ${files.length}개${s.truncated ? " (일부만 표시)" : ""}</h4>
+        <h4 style="margin:0 0 4px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">${esc(s.title)} · 파일 ${files.length}개${s.truncated ? " (일부만 표시)" : ""} ${action}</h4>
         ${s.note ? `<pre class="meta" style="margin:0 0 6px;white-space:pre-wrap">${esc(s.note)}</pre>` : ""}
         ${files.length ? `<ul style="margin:0 0 6px;padding-left:18px">${files.map(f => `<li><code>${esc(f)}</code></li>`).join("")}</ul>` : ""}
         ${s.diff ? `<pre class="diff">${diffHtml(s.diff)}</pre>` : ""}
       </section>`;
     }).join("")}`;
+}
+
+// ---------- 커밋·푸시·PR (사용자가 직접 누를 때만) ----------
+async function postJson(path, body) {
+  const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  let json = {};
+  try { json = await res.json(); } catch {}
+  return res.ok ? json : { error: json.error || "실패" };
+}
+
+async function openCommit(key) {
+  const body = document.getElementById("diff-body");
+  body.innerHTML = `<p class="meta">커밋할 내용을 준비하는 중…</p>`;
+  const p = await postJson("/api/commit/preview", { key });
+  if (p.error) { body.innerHTML = `<p class="err">${esc(p.error)}</p><button class="btn" data-back="${esc(key)}">돌아가기</button>`; return; }
+  body.innerHTML = `
+    <h4 style="margin:12px 0 4px">${esc(key)} 커밋·푸시·PR</h4>
+    <p class="meta">브랜치 <code>${esc(p.branch)}</code> · 전용 작업 폴더에서 실행 · 누를 때만 실행되고 자동으로는 하지 않습니다</p>
+    <p style="margin:10px 0 4px"><b>커밋할 파일</b></p>
+    <ul style="margin:0;padding-left:0;list-style:none">${p.files.map(f => `<li><label><input type="checkbox" name="cfile" value="${esc(f.path)}" checked style="width:auto"> <code>${esc(f.status)}</code> ${esc(f.path)}</label></li>`).join("")}</ul>
+    <p style="margin:10px 0 4px"><label for="c-msg"><b>커밋 메시지</b></label> <span class="meta">설정의 커밋 메시지 형식으로 만든 초안 · 고쳐도 됩니다</span></p>
+    <textarea id="c-msg" rows="9" style="width:100%;font:12px/1.45 ui-monospace,Menlo,monospace;border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:var(--surface);color:var(--text)">${esc(p.message)}</textarea>
+    <label style="display:block;margin-top:8px"><input type="checkbox" id="c-push" checked style="width:auto"> 커밋 후 <code>${esc(p.remote)}</code> 에 푸시</label>
+    <p class="meta">${p.prUrl ? "푸시가 되면 PR 만들기 링크를 보여줍니다." : "PR 주소 형식이 설정돼 있지 않아 PR 링크는 만들지 않습니다 (설정 탭)."}</p>
+    <div class="actions"><button class="btn primary" id="c-run" data-key="${esc(key)}">커밋 실행</button><button class="btn" data-back="${esc(key)}">취소</button></div>
+    <div id="c-result" role="status"></div>`;
+}
+
+async function runCommit(key) {
+  const files = [...document.querySelectorAll('input[name="cfile"]:checked')].map(c => c.value);
+  const message = document.getElementById("c-msg").value;
+  const push = document.getElementById("c-push").checked;
+  if (!files.length) return toast("커밋할 파일을 고르세요");
+  if (!confirm(`${key} 변경 ${files.length}개 파일을 커밋${push ? "하고 푸시" : ""}할까요?`)) return;
+  const btn = document.getElementById("c-run"); btn.disabled = true; btn.textContent = "실행 중…";
+  const r = await postJson("/api/commit", { key, message, files, push });
+  const out = document.getElementById("c-result");
+  btn.disabled = false; btn.textContent = "커밋 실행";
+  if (r.error) { out.innerHTML = `<p class="err">${esc(r.error)}</p>`; return; }
+  out.innerHTML = `<p>커밋 <code>${esc(r.commit)}</code> 완료${r.pushed ? ` · <code>${esc(r.branch)}</code> 푸시 완료` : ""}</p>
+    ${r.pushError ? `<p class="err">푸시 실패: ${esc(r.pushError)}<br>커밋은 남아 있습니다. 터미널에서 직접 푸시하세요.</p>` : ""}
+    ${r.prUrl ? `<a class="btn primary" href="${esc(r.prUrl)}" target="_blank" rel="noopener">PR 만들기 열기</a>` : ""}`;
+  btn.remove();
+  toast("커밋했습니다");
+  load();
+}
+
+async function restoreStash(key, ref) {
+  if (!confirm(`${key} 보관분(${ref})을 전용 작업 폴더로 꺼낼까요?\n작업 폴더가 ${key} 브랜치로 전환됩니다.`)) return;
+  const r = await postJson("/api/stash/restore", { key, ref });
+  if (r.error) return toast(r.error);
+  toast("작업 폴더로 꺼냈습니다");
+  openChanges(key);
 }
 
 async function pollJobs() {
@@ -606,6 +662,9 @@ async function renderProject(state) {
       <dd><input id="p-base" style="width:100%" placeholder="origin/develop" value="${esc(p.baseRef)}"></dd>
       <dt><label for="p-build">빌드 확인 명령</label></dt>
       <dd><input id="p-build" style="width:100%" placeholder="예: ./gradlew :app:compileDebugKotlin -q (비우면 작업 때 자동 판단)" value="${esc(p.buildCmd)}"></dd>
+      <dt><label for="p-commit">커밋 메시지 형식</label></dt>
+      <dd><textarea id="p-commit" rows="4" style="width:100%;font:12px/1.4 ui-monospace,Menlo,monospace;border:1px solid var(--line);border-radius:8px;padding:6px 10px;background:var(--surface);color:var(--text)" placeholder="{type}: {title} ({key})&#10;&#10;{changes}">${esc(p.commitTemplate)}</textarea>
+        <div class="meta">쓸 수 있는 값: {title} {key} {url} {type} {changes} · 비우면 위 기본 형식</div></dd>
       <dt><label for="p-pr">PR 주소 형식</label></dt>
       <dd><input id="p-pr" style="width:100%" placeholder="https://github.com/org/repo/compare/{base}...{branch}?expand=1" value="${esc(p.prUrl)}"></dd>
       <dt><label for="p-cats">제안 카테고리</label></dt>
@@ -737,6 +796,15 @@ document.querySelector("nav").addEventListener("click", e => {
 document.getElementById("reload").addEventListener("click", load);
 document.getElementById("diff-close").addEventListener("click", () => document.getElementById("diff-dialog").close());
 document.getElementById("diff-refresh").addEventListener("click", () => diffKey && openChanges(diffKey));
+document.getElementById("diff-body").addEventListener("click", e => {
+  const c = e.target.closest("[data-commit]");
+  if (c) return openCommit(c.dataset.commit);
+  const b = e.target.closest("[data-back]");
+  if (b) return openChanges(b.dataset.back);
+  if (e.target.id === "c-run") return runCommit(e.target.dataset.key);
+  const r = e.target.closest("[data-restore]");
+  if (r) return restoreStash(diffKey, r.dataset.restore);
+});
 document.getElementById("diff-dialog").addEventListener("click", e => { if (e.target.id === "diff-dialog") e.target.close(); });  // 바깥 클릭으로 닫기
 
 app.addEventListener("click", async e => {
@@ -762,7 +830,7 @@ app.addEventListener("click", async e => {
     const r = btn.id === "p-save"
       ? await projectCall("/api/project", { repo: document.getElementById("p-repo").value.trim(), branchPrefix: document.getElementById("p-prefix").value.trim(),
           baseRef: document.getElementById("p-base").value.trim(), categories: document.getElementById("p-cats").value.trim(),
-          buildCmd: document.getElementById("p-build").value.trim(),
+          buildCmd: document.getElementById("p-build").value.trim(), commitTemplate: document.getElementById("p-commit").value,
           prUrl: document.getElementById("p-pr").value.trim() })
       : await projectCall("/api/project/setup", {});
     btn.disabled = false;
