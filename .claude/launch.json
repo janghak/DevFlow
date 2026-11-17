@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "devflow",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["server.py", "4100"],
+      "port": 4100
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+# 토큰·개인 경로가 든 설정 (본인만)
+.env
+.env.tmp
+# 회사 Jira 내용·작업 로그·첨부가 쌓이는 곳
+data/
+__pycache__/
+*.pyc
+.DS_Store
