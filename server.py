@@ -1081,8 +1081,7 @@ def project_status():
             "workReady": repo_ok and is_worktree_of(WORK_REPO, REPO),
             "branch": git_at(REPO, "branch", "--show-current").stdout.strip() if repo_ok else "",
             "branchPrefix": branch_prefix(), "categories": ", ".join(categories()),
-            "buildCmd": build_cmd(), "commitTemplate": jf.public_config()["commitTemplate"],
-            "prUrl": jf.load_config()["DEVFLOW_PR_URL"]}
+            "buildCmd": build_cmd(), "prUrl": jf.load_config()["DEVFLOW_PR_URL"]}
 
 
 def find_candidates():
@@ -1157,15 +1156,12 @@ def save_project(body):
     pr = str(body.get("prUrl") or "").strip()
     if pr and not PR_URL_RE.fullmatch(pr):
         return 400, {"error": "PR 주소 형식은 https:// 로 시작해야 합니다 (예: https://github.com/org/repo/compare/{base}...{branch}?expand=1)"}
-    template = str(body.get("commitTemplate") or "").replace("\r", "").strip()
-    if len(template) > 1000:
-        return 400, {"error": "커밋 메시지 형식은 1000자 이내입니다"}
     work = repo + "-devflow"  # 전용 작업 폴더는 사용자가 정하지 않고 소스 폴더 옆에 자동으로 둔다
     if os.path.exists(work) and not is_worktree_of(work, repo) and (not os.path.isdir(work) or os.listdir(work)):
         return 400, {"error": f"{work} 에 다른 파일이 있어 전용 작업 폴더를 만들 수 없습니다. 그 폴더를 옮기거나 이름을 바꾼 뒤 다시 저장하세요"}
     jf.write_env({"DEVFLOW_REPO": repo, "DEVFLOW_WORK_REPO": work, "DEVFLOW_BRANCH_PREFIX": prefix,
                   "DEVFLOW_BASE_REF": ref, "DEVFLOW_CATEGORIES": ",".join(cats), "DEVFLOW_BUILD_CMD": build,
-                  "DEVFLOW_PR_URL": pr, "DEVFLOW_COMMIT_TEMPLATE": template.replace("\n", "\\n")})
+                  "DEVFLOW_PR_URL": pr})
     if (REPO, WORK_REPO) != (repo, work):
         devflow_untracked.clear()
     REPO, WORK_REPO = repo, work

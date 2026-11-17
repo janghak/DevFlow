@@ -14,7 +14,7 @@ python3 -I {{DEVFLOW}}/bin/jira_fetch.py --config
 ```
 JSON 으로 나오는 값을 이 문서 전체에서 쓴다 (토큰은 나오지 않는다):
 - `repo` 작업 저장소 (git 명령은 여기서 실행), `branchPrefix` 브랜치 접두어, `baseRef` 기준 브랜치
-- `buildCmd` 빌드 확인 명령, `commitTemplate` 커밋 메시지 형식, `prUrl` PR 주소 형식
+- `buildCmd` 빌드 확인 명령, `prUrl` PR 주소 형식
 값이 비어 있어 진행할 수 없으면 멈추고, 대시보드(`python3 {{DEVFLOW}}/server.py` → http://127.0.0.1:4100) **설정** 탭에서 채우라고 안내한다.
 
 ## 절대 규칙
@@ -91,12 +91,7 @@ worklog JSON 을 채운다:
 마지막으로 사용자에게: 변경 요약, 브랜치명, 미검증 항목, "커밋/푸시/PR 은 요청 시 진행" 을 알린다.
 
 ## 6. 사용자가 요청할 때만: 커밋 / 푸시 / PR
-**커밋** — `commitTemplate` 을 따른다. `{title}` 티켓 제목, `{key}` 키, `{url}` 티켓 URL, `{type}` feat 또는 fix, `{changes}` 변경 목록(번호 매김)으로 채운다. 비어 있으면 아래 기본 형식을 쓴다. 작업한 파일만 `git add <경로>` (전체 add 금지, 하위 저장소 제외).
-```
-{type}: {title} ({key})
-
-{changes}
-```
+**커밋** — 저장소의 최근 커밋 메시지(`git log -5 --format=%B`)와 같은 형식을 따르고, 티켓 제목·키·URL 과 변경 내용을 넣는다. 일정한 형식이 없으면 `<feat|fix>: <티켓 제목> (<KEY>)` 다음 줄에 변경 목록을 쓴다. 작업한 파일만 `git add <경로>` (전체 add 금지, 하위 저장소 제외).
 커밋 후 worklog `commits` 에 해시 추가, `status` → `committed`.
 
 **푸시** — `git push -u <원격> <branchPrefix><KEY>`. worklog `status` → `pushed`.

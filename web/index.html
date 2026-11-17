@@ -606,9 +606,6 @@ async function renderProject(state) {
       <dd><input id="p-base" style="width:100%" placeholder="origin/develop" value="${esc(p.baseRef)}"></dd>
       <dt><label for="p-build">빌드 확인 명령</label></dt>
       <dd><input id="p-build" style="width:100%" placeholder="예: ./gradlew :app:compileDebugKotlin -q (비우면 작업 때 자동 판단)" value="${esc(p.buildCmd)}"></dd>
-      <dt><label for="p-commit">커밋 메시지 형식</label></dt>
-      <dd><textarea id="p-commit" rows="4" style="width:100%;font:12px/1.4 ui-monospace,Menlo,monospace;border:1px solid var(--line);border-radius:8px;padding:6px 10px;background:var(--surface);color:var(--text)" placeholder="{type}: {title} ({key})&#10;&#10;{changes}">${esc(p.commitTemplate)}</textarea>
-        <div class="meta">쓸 수 있는 값: {title} {key} {url} {type} {changes} · 비우면 위 기본 형식</div></dd>
       <dt><label for="p-pr">PR 주소 형식</label></dt>
       <dd><input id="p-pr" style="width:100%" placeholder="https://github.com/org/repo/compare/{base}...{branch}?expand=1" value="${esc(p.prUrl)}"></dd>
       <dt><label for="p-cats">제안 카테고리</label></dt>
@@ -765,7 +762,7 @@ app.addEventListener("click", async e => {
     const r = btn.id === "p-save"
       ? await projectCall("/api/project", { repo: document.getElementById("p-repo").value.trim(), branchPrefix: document.getElementById("p-prefix").value.trim(),
           baseRef: document.getElementById("p-base").value.trim(), categories: document.getElementById("p-cats").value.trim(),
-          buildCmd: document.getElementById("p-build").value.trim(), commitTemplate: document.getElementById("p-commit").value,
+          buildCmd: document.getElementById("p-build").value.trim(),
           prUrl: document.getElementById("p-pr").value.trim() })
       : await projectCall("/api/project/setup", {});
     btn.disabled = false;
