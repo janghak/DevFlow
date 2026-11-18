@@ -30,6 +30,7 @@
 - POST /api/commit/preview     {"key"} 커밋할 파일·메시지 초안 (사용자 확인용)
 - POST /api/commit             {"key", "message", "files", "push"} 사용자가 누른 경우에만 커밋(+푸시), PR 주소 반환
 - POST /api/stash/restore      {"key", "ref"} 보관된 티켓 수정을 작업 폴더로 다시 꺼내기
+- POST /api/bring             {"key", "ref"?} 티켓 작업을 내 소스 폴더로 가져오기 (브랜치 전환 + 수정 옮기기)
 - GET  /api/changes/<KEY>      티켓 브랜치의 변경 (커밋된 것 + 현재 작업 트리 + devflow stash)
 """
 import datetime
@@ -645,6 +646,9 @@ def enqueue_job(key, mode, auto=False):
         return 400, {"error": "설정 탭에서 소스 폴더를 지정하고 전용 작업 폴더를 먼저 만드세요"}
     if engine_gate():
         return 400, {"error": engine_gate()}
+    held = mode == "work" and held_elsewhere(branch_prefix() + key)
+    if held:
+        return 409, {"error": f"{key} 브랜치가 {held} 에 체크아웃되어 있습니다. 그 폴더에서 다른 브랜치로 바꾼 뒤 다시 시도하세요"}
     with job_cv:
         busy = [work_state] if work_state.get("status") == "running" else []
         if any(j.get("key") == key and j.get("mode") == mode for j in busy + job_queue):
@@ -1016,10 +1020,19 @@ def ticket_changes(key):
             sections.append({"title": f"보관된 변경 ({ref})",
                              "note": f"되살리기: git switch {branch} 후 git stash pop {ref}",
                              "diff": git("stash", "show", "-p", "--include-untracked", ref).stdout})
+    held = held_elsewhere(branch)
+    if held:  # 내 폴더로 가져간 작업: 그 폴더의 추적 파일 수정 + 가져올 때 옮긴 새 파일만 (사용자의 다른 파일은 제외)
+        diff = git_at(held, "diff", "HEAD", "--ignore-submodules=all").stdout
+        brought = read_json(os.path.join(WORKLOG, f"{key}.json"), {}).get("broughtFiles") or []
+        new = set(git_at(held, "ls-files", "--others", "--exclude-standard").stdout.splitlines())
+        for p in sorted(set(brought) & new):
+            diff += git_at(held, "diff", "--no-index", "--", "/dev/null", p).stdout
+        sections.append({"title": "내 폴더의 커밋 안 된 변경", "note": held, "diff": diff})
     for s in sections:
         s["truncated"] = len(s["diff"]) > DIFF_LIMIT
         s["diff"] = s["diff"][:DIFF_LIMIT]
-    return 200, {"key": key, "branch": branch, "exists": True, "current": current == branch, "sections": sections}
+    return 200, {"key": key, "branch": branch, "exists": True, "current": current == branch,
+                 "heldBy": held, "sections": sections}
 
 
 # ---------- 소스 프로젝트 설정 (경로 선택·전용 작업 폴더 만들기) ----------
@@ -1357,6 +1370,72 @@ def restore_stash(body):
     return 200, {"branch": branch}
 
 
+def held_elsewhere(branch):
+    """그 브랜치를 전용 작업 폴더가 아닌 다른 폴더(보통 내 소스 폴더)가 체크아웃하고 있으면 그 경로."""
+    path = None
+    for line in git("worktree", "list", "--porcelain").stdout.splitlines():
+        if line.startswith("worktree "):
+            path = os.path.realpath(line[9:])
+        elif line == f"branch refs/heads/{branch}" and path != os.path.realpath(WORK_REPO):
+            return path
+    return None
+
+
+def bring_to_mine(body):
+    """사용자가 누를 때만: 티켓 작업을 내 소스 폴더(REPO)로 옮긴다. 작업 폴더는 그 브랜치에서 떼어 둔다."""
+    key = str(body.get("key") or "").strip().upper()
+    ref = str(body.get("ref") or "")
+    if not KEY_RE.match(key) or (ref and not STASH_REF_RE.fullmatch(ref)):
+        return 400, {"error": "잘못된 요청"}
+    if anything_running():
+        return 409, {"error": "작업이 실행 중이거나 대기 중이라 지금은 가져올 수 없습니다. 대기열이 끝난 뒤 다시 누르세요"}
+    branch = branch_prefix() + key
+    if git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}").returncode != 0:
+        return 400, {"error": "이 티켓의 브랜치가 없습니다"}
+    mine = lambda *a: git_at(REPO, *a)
+    if mine("status", "--porcelain", "-uno", "--ignore-submodules=all").stdout.strip():
+        return 400, {"error": f"내 소스 폴더({REPO})에 커밋 안 된 수정이 있습니다. 커밋하거나 보관한 뒤 다시 누르세요"}
+    if ref:
+        entry = next((l for l in git("stash", "list").stdout.splitlines() if l.startswith(ref + ":")), "")
+        if f"devflow: {branch} (" not in entry:
+            return 400, {"error": "이 티켓의 devflow 보관분이 아닙니다. 새로고침 후 다시 시도하세요"}
+    moved = False
+    if git("branch", "--show-current").stdout.strip() == branch:
+        if ref:
+            return 400, {"error": "작업 폴더에 이 티켓이 꺼내져 있습니다. '커밋 안 된 변경' 쪽 버튼을 쓰세요"}
+        changed = [p for p in git("diff", "--name-only", "HEAD", "--ignore-submodules=all").stdout.splitlines() if p]
+        new = [p for p in git("ls-files", "--others", "--exclude-standard").stdout.splitlines() if p]
+        if changed or new:
+            r = git("stash", "push", "-u", "-m", f"devflow: {branch} (내 폴더로 가져오기)", "--", *changed, *new)
+            if r.returncode != 0:
+                return 500, {"error": f"작업 폴더 보관 실패: {(r.stderr or r.stdout).strip()[:300]}"}
+            ref, moved = "stash@{0}", True
+            devflow_untracked.clear()
+        git("switch", "--detach")  # 같은 브랜치는 두 폴더가 동시에 체크아웃할 수 없다
+
+    def undo():  # 내 폴더로 못 옮겼으면 작업 폴더를 원래대로
+        if moved:
+            git("switch", branch)
+            git("stash", "pop", ref)
+
+    r = mine("switch", branch)
+    if r.returncode != 0:
+        undo()
+        return 500, {"error": f"내 폴더 브랜치 전환 실패: {(r.stderr or r.stdout).strip()[:300]}"}
+    if ref:
+        files = [p for p in git("stash", "show", "--name-only", "--include-untracked", ref).stdout.splitlines() if p]
+        path = os.path.join(WORKLOG, f"{key}.json")
+        log = read_json(path, None)
+        if isinstance(log, dict):  # 팝업에서 옮긴 새 파일을 계속 보여주려고 기록
+            log["broughtFiles"] = sorted(set(log.get("broughtFiles") or []) | set(files))
+            write_json(path, log)
+        r = mine("stash", "pop", ref)
+        if r.returncode != 0:
+            return 500, {"error": f"브랜치는 {branch} 로 바꿨지만 수정 꺼내기에 실패했습니다 (충돌일 수 있음). "
+                                  f"보관분은 남아 있으니 내 폴더에서 git stash list 로 확인하세요: {(r.stderr or r.stdout).strip()[:300]}"}
+    return 200, {"branch": branch, "repo": REPO}
+
+
 class Handler(BaseHTTPRequestHandler):
     def send(self, code, body, ctype="application/json; charset=utf-8"):
         raw = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode()
@@ -1432,6 +1511,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(*commit_run(body))
         if self.path == "/api/stash/restore":
             return self.send(*restore_stash(body))
+        if self.path == "/api/bring":
+            return self.send(*bring_to_mine(body))
         if self.path == "/api/project/candidates":
             return self.send(*find_candidates())
         if self.path == "/api/project/pick":

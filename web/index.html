@@ -323,6 +323,8 @@ function renderWork() {
 
 // ---------- 내 Jira ----------
 let jira = null, jiraFilter = "";
+try { jiraFilter = localStorage.getItem("devflow.jstatus") || ""; } catch {}
+function setJiraFilter(v) { jiraFilter = v; try { localStorage.setItem("devflow.jstatus", v); } catch {} }
 // 생성일 기간: 마지막 선택을 이 브라우저에 기억 (저장소를 못 쓰면 기본값 '전체')
 let period = { field: "created", preset: "all", from: "", to: "" };
 try { period = { ...period, ...JSON.parse(localStorage.getItem("devflow.period") || "{}") }; } catch {}
@@ -337,7 +339,7 @@ function periodRange() {
 function setPeriod(patch) {
   period = { ...period, ...patch };
   try { localStorage.setItem("devflow.period", JSON.stringify(period)); } catch {}
-  jiraFilter = "";
+  setJiraFilter("");
   renderJira(true);
 }
 async function renderJira(refresh = false) {
@@ -352,6 +354,7 @@ async function renderJira(refresh = false) {
     if (tab !== "jira") return;
   }
   const statuses = [...new Set(jira.items.map(i => i.status))];
+  if (jiraFilter && !jira.items.some(i => i.status === jiraFilter)) setJiraFilter("");  // 기억한 상태가 목록에 없으면 전체로
   const list = jira.items.filter(i => !jiraFilter || i.status === jiraFilter);
   app.innerHTML = `
     <div class="filters">
@@ -475,12 +478,14 @@ async function openChanges(key) {
   if (c.error) { body.innerHTML = `<p class="err">${esc(c.error)}</p>`; return; }
   const running = busy() && jobs.current.key === key && jobs.current.mode === "work";
   body.innerHTML = `
-    <p class="meta">브랜치 <code>${esc(c.branch)}</code>${c.current ? " · 지금 체크아웃됨" : ""}${running ? " · 작업 중 (5초마다 갱신)" : ""} · 서브모듈 포인터 제외</p>
+    <p class="meta">브랜치 <code>${esc(c.branch)}</code>${c.current ? " · 작업 폴더에 체크아웃됨" : ""}${c.heldBy ? ` · <b>내 폴더(${esc(c.heldBy)})에 가져와 있음</b> — 빌드·커밋은 Android Studio 에서` : ""}${running ? " · 작업 중 (5초마다 갱신)" : ""} · 서브모듈 포인터 제외</p>
     ${!c.exists ? `<p>아직 이 티켓의 브랜치가 없습니다.</p>` : !c.sections.length ? `<p>변경 사항이 없습니다.</p>` : c.sections.map(s => {
       const files = [...s.diff.matchAll(/^diff --git a\/(.+?) b\//gm)].map(m => m[1]);
       const stashRef = (s.title.match(/stash@\{\d+\}/) || [])[0];
-      const action = stashRef ? `<button class="btn" data-restore="${esc(stashRef)}" ${busy() || jobs.queue.length ? "disabled" : ""}>작업 폴더로 꺼내기</button>`
-        : s.title.startsWith("커밋 안 된") ? `<button class="btn primary" data-commit="${esc(key)}" ${busy() || jobs.queue.length ? "disabled" : ""}>커밋·푸시·PR…</button>` : "";
+      const off = busy() || jobs.queue.length ? "disabled" : "";
+      const bring = `<button class="btn primary" data-bring="${esc(stashRef || "")}" ${off}>내 폴더로 가져오기</button>`;
+      const action = stashRef ? `${bring}<button class="btn" data-restore="${esc(stashRef)}" ${off}>작업 폴더로 꺼내기</button>`
+        : s.title.startsWith("커밋 안 된") ? `${bring}<button class="btn" data-commit="${esc(key)}" ${off}>커밋·푸시·PR…</button>` : "";
       return `<section style="margin-top:14px">
         <h4 style="margin:0 0 4px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">${esc(s.title)} · 파일 ${files.length}개${s.truncated ? " (일부만 표시)" : ""} ${action}</h4>
         ${s.note ? `<pre class="meta" style="margin:0 0 6px;white-space:pre-wrap">${esc(s.note)}</pre>` : ""}
@@ -533,6 +538,14 @@ async function runCommit(key) {
   btn.remove();
   toast("커밋했습니다");
   load();
+}
+
+async function bringToMine(key, ref) {
+  if (!confirm(`${key} 작업을 내 소스 폴더로 가져올까요?\n내 폴더가 ${key} 브랜치로 바뀌고 수정 내용이 옮겨집니다.\n(내 폴더에 커밋 안 된 수정이 있으면 거절됩니다. Android Studio 는 Gradle sync 가 다시 돌 수 있습니다)`)) return;
+  const r = await postJson("/api/bring", ref ? { key, ref } : { key });
+  if (r.error) return toast(r.error);
+  toast(`내 폴더(${r.repo})를 ${r.branch} 로 바꾸고 작업을 옮겼습니다`);
+  openChanges(key);
 }
 
 async function restoreStash(key, ref) {
@@ -802,6 +815,8 @@ document.getElementById("diff-body").addEventListener("click", e => {
   const b = e.target.closest("[data-back]");
   if (b) return openChanges(b.dataset.back);
   if (e.target.id === "c-run") return runCommit(e.target.dataset.key);
+  const g = e.target.closest("[data-bring]");
+  if (g) return bringToMine(diffKey, g.dataset.bring);
   const r = e.target.closest("[data-restore]");
   if (r) return restoreStash(diffKey, r.dataset.restore);
 });
@@ -853,7 +868,7 @@ app.addEventListener("click", async e => {
   const jr = e.target.closest("[data-jremove]");
   if (jr) return removeJob(Number(jr.dataset.jremove));
   const jchip = e.target.closest("[data-jstatus]");
-  if (jchip) { jiraFilter = jchip.dataset.jstatus; return renderJira(); }
+  if (jchip) { setJiraFilter(jchip.dataset.jstatus); return renderJira(); }
   if (e.target.id === "j-test") {
     const ok = await jiraCall("/api/jira/test");
     if (ok) document.getElementById("j-status").textContent = `연결 성공: ${ok.name || "확인됨"}`;
