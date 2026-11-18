@@ -30,6 +30,7 @@
 - POST /api/commit/preview     {"key"} 커밋할 파일·메시지 초안 (사용자 확인용)
 - POST /api/commit             {"key", "message", "files", "push"} 사용자가 누른 경우에만 커밋(+푸시), PR 주소 반환
 - POST /api/stash/restore      {"key", "ref"} 보관된 티켓 수정을 작업 폴더로 다시 꺼내기
+- POST /api/project/remote-check  {} 소스 폴더의 원격 저장소 접속 점검 (원인별 해결 안내)
 - POST /api/bring             {"key", "ref"?} 티켓 작업을 내 소스 폴더로 가져오기 (브랜치 전환 + 수정 옮기기)
 - GET  /api/changes/<KEY>      티켓 브랜치의 변경 (커밋된 것 + 현재 작업 트리 + devflow stash)
 """
@@ -38,6 +39,7 @@ import codex_runner
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -466,8 +468,30 @@ job_seq = [0]
 devflow_untracked = set()  # 직전 devflow 작업이 새로 만든 untracked 파일 (사용자 파일과 구분해 stash 하려고)
 
 
-def git(*args):
-    return subprocess.run(["git", *args], cwd=WORK_REPO, capture_output=True, text=True, timeout=120)
+# 원격 접속에서 비밀번호·passphrase 를 묻느라 멈추지 않게: 프롬프트 끄기 + 터미널에서 떼어 실행(ssh 가 /dev/tty 로 못 물음).
+# 인증이 안 되면 기다리지 않고 바로 실패한다. 서버가 띄우는 Claude/Codex 와 그 안의 git 도 이 환경을 물려받는다.
+os.environ.setdefault("GIT_TERMINAL_PROMPT", "0")
+os.environ.setdefault("GCM_INTERACTIVE", "never")
+os.environ.setdefault("GIT_HTTP_LOW_SPEED_LIMIT", "1000")  # 1KB/s 미만이 20초 이어지면 끊기 (VPN 끊김 등)
+os.environ.setdefault("GIT_HTTP_LOW_SPEED_TIME", "20")
+REMOTE_TIMEOUT_SEC = 60
+
+
+def git(*args, timeout=120):
+    return subprocess.run(["git", *args], cwd=WORK_REPO, capture_output=True, text=True, timeout=timeout,
+                          stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+def git_remote(*args):
+    """원격 접속 git: 시간 초과도 실패 결과로 돌려준다 (예외로 작업 전체가 죽지 않게)."""
+    try:
+        return git(*args, timeout=REMOTE_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", f"{REMOTE_TIMEOUT_SEC}초 안에 원격 저장소 응답이 없습니다")
+
+
+REMOTE_HINT = ("원격 저장소에 접속하지 못했습니다. VPN·네트워크와, 터미널에서 소스 폴더의 git fetch 가 "
+               "비밀번호 입력 없이 되는지 확인하세요 (SSH 키 등록 또는 자격 증명 저장 필요)")
 
 
 def untracked():
@@ -574,7 +598,8 @@ def run_job(job):
                "--add-dir", ROOT, "--max-budget-usd", ANALYZE_BUDGET_USD if analyze else WORK_BUDGET_USD,
                "--max-turns", "200"]
         with open(log_path, "w", encoding="utf-8") as log:
-            proc = subprocess.Popen(cmd, cwd=WORK_REPO, stdout=subprocess.PIPE, stderr=log, text=True, stdin=subprocess.DEVNULL)
+            proc = subprocess.Popen(cmd, cwd=WORK_REPO, stdout=subprocess.PIPE, stderr=log, text=True, stdin=subprocess.DEVNULL,
+                                    start_new_session=True)
             killer = threading.Timer(timeout, proc.kill)
             killer.start()
             try:
@@ -684,15 +709,23 @@ def prepare_codex_branch(key):
     checked("check-ref-format", "--branch", branch)
     if git("show-ref", "--verify", "--quiet", "refs/heads/" + branch).returncode == 0:
         checked("switch", branch)
-    else:
-        remote = checked("ls-remote", "--heads", "origin", "refs/heads/" + branch)
-        if remote:
-            checked("fetch", "origin", "refs/heads/" + branch)
-            checked("switch", "-c", branch, "FETCH_HEAD", "--no-track")
-        else:
-            ref = base_ref()
-            checked("fetch", "origin")
-            checked("switch", "-c", branch, ref, "--no-track")
+        return branch
+    remote, base = remote_and_base()
+    r = git_remote("ls-remote", "--heads", remote, "refs/heads/" + branch)
+    if r.returncode == 0 and r.stdout.strip():
+        f = git_remote("fetch", remote, "refs/heads/" + branch)
+        if f.returncode:
+            raise RuntimeError(f"{REMOTE_HINT}\n{(f.stderr or f.stdout).strip()[:500]}")
+        checked("switch", "-c", branch, "FETCH_HEAD", "--no-track")
+        return branch
+    ref = base_ref()
+    f = git_remote("fetch", remote, base) if r.returncode == 0 else r
+    if f.returncode:
+        # 원격에 못 닿아도 기준 브랜치가 로컬에 있으면 그걸로 시작한다 (최신이 아닐 수 있음을 알림)
+        if git("rev-parse", "--verify", "--quiet", ref).returncode:
+            raise RuntimeError(f"{REMOTE_HINT}\n{(f.stderr or f.stdout).strip()[:500]}")
+        codex_step("브랜치 준비", f"원격 접속 실패 — 로컬에 있는 {ref} 로 시작합니다 (최신이 아닐 수 있음)")
+    checked("switch", "-c", branch, ref, "--no-track")
     return branch
 
 
@@ -1056,7 +1089,8 @@ def under_home(path):
 
 
 def git_at(path, *args, timeout=120):
-    return subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, timeout=timeout,
+                          stdin=subprocess.DEVNULL, start_new_session=True)
 
 
 def repo_root(path):
@@ -1332,7 +1366,7 @@ def commit_run(body):
     if body.get("push"):
         remote, _ = remote_and_base()
         p = subprocess.run(["git", "push", "-u", remote, branch], cwd=WORK_REPO, capture_output=True, text=True,
-                           timeout=300, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+                           timeout=300, stdin=subprocess.DEVNULL, start_new_session=True)
         if p.returncode == 0:
             result.update(pushed=True, prUrl=pr_url(branch))
         else:
@@ -1436,6 +1470,59 @@ def bring_to_mine(body):
     return 200, {"branch": branch, "repo": REPO}
 
 
+REMOTE_CAUSES = [  # (원인, stderr 에 나오는 문구들)
+    ("host_key", ("Host key verification failed",)),
+    ("ssh_auth", ("Permission denied (publickey", "Permission denied, please try again")),
+    ("https_auth", ("could not read Username", "could not read Password", "terminal prompts disabled",
+                    "Authentication failed", "returned error: 401", "returned error: 403", "Invalid username or password")),
+    ("network", ("Could not resolve host", "Connection timed out", "Connection refused", "Operation timed out",
+                 "Network is unreachable", "Failed to connect", "원격 저장소 응답이 없습니다", "Operation too slow")),
+]
+
+
+def remote_check():
+    """설정 탭: 소스 폴더에서 원격 저장소에 비밀번호 입력 없이 닿는지 확인하고, 안 되면 원인별 해결 방법을 준다."""
+    if not REPO or not repo_root(REPO):
+        return 400, {"error": "소스 폴더를 먼저 저장하세요"}
+    remote, base = remote_and_base()
+    u = git_at(REPO, "remote", "get-url", remote)
+    if u.returncode:
+        return 200, {"ok": False, "cause": "no_remote", "remote": remote,
+                     "hints": [f"소스 폴더에 원격 '{remote}' 이 없습니다. 기준 브랜치 값(원격/브랜치)을 확인하세요"]}
+    url = re.sub(r"(https?://)[^/@\s]+@", r"\1***@", u.stdout.strip())  # 주소에 섞인 토큰은 가린다
+    host = (re.search(r"(?:@|://)([^/:@\s]+)", url) or [None, ""])[1]
+    ssh = not url.startswith("http")
+    started = time.time()
+    try:
+        r = git_at(REPO, "ls-remote", "--heads", remote, "refs/heads/" + base, timeout=REMOTE_TIMEOUT_SEC)
+        err = (r.stderr or "").strip()
+    except subprocess.TimeoutExpired:
+        r, err = None, f"{REMOTE_TIMEOUT_SEC}초 안에 원격 저장소 응답이 없습니다"
+    result = {"remote": remote, "url": url, "ssh": ssh, "seconds": round(time.time() - started, 1)}
+    if r is not None and r.returncode == 0:
+        found = bool(r.stdout.strip())
+        return 200, {**result, "ok": True, "baseFound": found,
+                     "hints": [] if found else [f"접속은 되지만 원격에 '{base}' 브랜치가 없습니다. 기준 브랜치 값을 확인하세요"]}
+    cause = next((c for c, keys in REMOTE_CAUSES if any(k in err for k in keys)), "unknown")
+    if cause == "unknown" and not ssh and "prompt" in err.lower():
+        cause = "https_auth"
+    fetch = f"cd {shlex.quote(REPO)} && git fetch {remote}"
+    hints = {
+        "network": [f"회사 Git 서버({host})에 닿지 않습니다. VPN·사내망 연결을 확인하세요"],
+        "host_key": ["처음 접속하는 서버라 신뢰 확인이 필요합니다. 터미널에서 한 번 실행해 yes 로 저장하세요:", fetch],
+        "ssh_auth": ["SSH 키가 없거나 회사 Git 에 등록되지 않았습니다.",
+                     "1) 키 만들기: ssh-keygen -t ed25519",
+                     f"2) ~/.ssh/id_ed25519.pub 내용을 회사 Git 웹({host}) 설정의 SSH keys 에 등록",
+                     "3) passphrase 를 넣었다면 키체인에 저장: ssh-add --apple-use-keychain ~/.ssh/id_ed25519",
+                     f"4) 확인: ssh -T git@{host}"],
+        "https_auth": ["저장된 로그인 정보가 없습니다. 키체인에 저장하도록 설정한 뒤 터미널에서 한 번 로그인하세요:",
+                       "git config --global credential.helper osxkeychain", fetch,
+                       "아이디와 비밀번호(또는 회사 Git 토큰)를 입력하면 키체인에 저장되어 이후에는 묻지 않습니다"],
+        "unknown": ["터미널에서 아래를 실행해 비밀번호 입력 없이 되는지 확인하세요:", fetch],
+    }[cause]
+    return 200, {**result, "ok": False, "cause": cause, "hints": hints, "detail": err[-600:]}
+
+
 class Handler(BaseHTTPRequestHandler):
     def send(self, code, body, ctype="application/json; charset=utf-8"):
         raw = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode()
@@ -1517,6 +1604,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(*find_candidates())
         if self.path == "/api/project/pick":
             return self.send(*pick_folder(body.get("start")))
+        if self.path == "/api/project/remote-check":
+            return self.send(*remote_check())
         if self.path == "/api/project/plan":
             return self.send(*setup_plan())
         if self.path == "/api/project/setup":

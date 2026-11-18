@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -69,6 +70,40 @@ class CommitFlowTest(unittest.TestCase):
     def test_refused_while_job_running(self):
         s.work_state["status"] = "running"
         self.assertEqual(s.commit_run({"key": "TT-1", "message": "x", "files": ["a.txt"]})[0], 409)
+
+
+class RemoteUnreachableTest(CommitFlowTest):
+    """원격이 인증을 묻거나 응답이 없어도 멈추지 않고, 로컬 기준 브랜치로 시작한다."""
+
+    def _remote(self, url):
+        run(s.REPO, "git", "config", "protocol.ext.allow", "always")
+        run(s.REPO, "git", "remote", "set-url", "origin", url)
+        s.work_state["steps"] = []
+
+    def test_prompt_does_not_hang(self):
+        self._remote("ext::sh -c 'cat /dev/tty >/dev/null; sleep 30'")  # 비밀번호 묻는 원격 흉내
+        started = time.time()
+        self.assertEqual(s.prepare_codex_branch("TT-9"), "feature/TT-9")
+        self.assertLess(time.time() - started, 10)
+        self.assertIn("로컬", s.work_state["steps"][-1]["detail"])
+
+    def test_remote_check_reports_cause(self):
+        self.assertTrue(s.remote_check()[1]["ok"])  # 정상 원격
+        script = os.path.join(s.HOME, "fail.sh")
+        open(script, "w").write("echo 'fatal: could not read Username for https://git.example.com' >&2; exit 128\n")
+        self._remote(f"ext::sh {script}")
+        r = s.remote_check()[1]
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["cause"], "https_auth")
+        self.assertIn("credential.helper osxkeychain", "\n".join(r["hints"]))
+
+    def test_timeout_falls_back(self):
+        self._remote("ext::sh -c 'sleep 30'")  # 응답 없는 원격
+        old, s.REMOTE_TIMEOUT_SEC = s.REMOTE_TIMEOUT_SEC, 2
+        try:
+            self.assertEqual(s.prepare_codex_branch("TT-9"), "feature/TT-9")
+        finally:
+            s.REMOTE_TIMEOUT_SEC = old
 
 
 class BringToMineTest(CommitFlowTest):

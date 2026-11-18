@@ -689,7 +689,7 @@ async function renderProject(state) {
       <button class="btn" id="p-cands">후보 찾기</button>
       <button class="btn" id="p-pick">폴더 선택…</button>
       <button class="btn primary" id="p-save">저장</button>
-      ${p.repoOk ? `<button class="btn" id="p-check">작업 폴더 다시 점검</button>` : ""}
+      ${p.repoOk ? `<button class="btn" id="p-check">작업 폴더 다시 점검</button><button class="btn" id="p-remote">원격 접속 점검</button>` : ""}
     </div>
     <div class="meta" role="status" style="margin-top:8px">${p.error ? `<span class="err">${esc(p.error)}</span>` : `
       ${mark(p.repoOk, "git 저장소")} ${mark(p.baseOk, `기준 브랜치 ${p.baseRef}`)} ${mark(p.workReady, "전용 작업 폴더 준비됨")}
@@ -838,6 +838,15 @@ app.addEventListener("click", async e => {
     if (r?.path) { document.getElementById("p-repo").value = r.path; setPanel(`<p class="meta">선택했습니다. <b>저장</b>을 눌러 적용하세요.</p>`); }
     else setPanel("");
     return;
+  }
+  if (e.target.id === "p-remote") {
+    setPanel(`<p class="meta">원격 저장소에 접속해 보는 중… (최대 1분)</p>`);
+    const r = await postJson("/api/project/remote-check", {});
+    if (r.error) return setPanel(`<p class="err">${esc(r.error)}</p>`);
+    const where = r.url ? ` <code style="word-break:break-all">${esc(r.url)}</code> (${r.seconds}초)` : "";
+    return setPanel(`<p class="${r.ok && r.baseFound !== false ? "" : "err"}">${r.ok ? "✓ 원격 접속 OK" : "✗ 원격 접속 실패"} · ${esc(r.remote)}${where}</p>
+      ${r.hints.length ? `<pre class="meta" style="white-space:pre-wrap;user-select:all">${esc(r.hints.join("\n"))}</pre>` : ""}
+      ${r.detail ? `<details><summary class="meta">git 메시지</summary><pre class="meta" style="white-space:pre-wrap">${esc(r.detail)}</pre></details>` : ""}`);
   }
   if (e.target.id === "p-save" || e.target.id === "p-check") {
     const btn = e.target; btn.disabled = true;
