@@ -447,8 +447,8 @@ function showJobs() {
     : `<span>실행 중인 작업이 없습니다.</span>`;
   if (jobs.queue.length) html += `<h4 style="margin:14px 0 6px">대기열 ${jobs.queue.length}</h4><ol style="margin:0;padding-left:20px">${jobs.queue.map(j =>
     `<li style="margin-bottom:4px">${esc(j.key)} · ${MODE[j.mode]}${j.auto ? ` <span class="badge b-ax">자동</span>` : ""} <button class="btn" style="padding:2px 8px" data-jremove="${j.id}">빼기</button></li>`).join("")}</ol>`;
-  if (jobs.history.length) html += `<h4 style="margin:14px 0 6px">최근 결과</h4>` + jobs.history.map((h, i) => `
-    <details ${i === 0 && !busy() ? "open" : ""} style="margin-bottom:6px"><summary><b>${esc(resultHead(h))}</b></summary>
+  if (jobs.history.length) html += `<h4 style="margin:14px 0 6px;display:flex;gap:8px;align-items:center">최근 결과 <button class="btn" style="padding:2px 8px" data-jdismiss="all">모두 지우기</button></h4>` + jobs.history.map((h, i) => `
+    <details ${i === 0 && !busy() ? "open" : ""} style="margin-bottom:6px"><summary><b>${esc(resultHead(h))}</b> <button class="btn" style="padding:2px 8px" data-jdismiss="${h.id}" aria-label="${esc(h.key)} 결과 지우기">지우기</button></summary>
       ${h.stashed ? `<p class="meta">시작 전 보관: ${esc(h.stashed)}</p>` : ""}
       ${h.error ? `<p class="err">${esc(h.error)}</p>` : ""}
       ${h.message ? `<div style="margin-top:6px;color:var(--text);white-space:pre-wrap">${esc(h.message)}</div>` : ""}
@@ -874,6 +874,13 @@ app.addEventListener("click", async e => {
   if (jb) { const [mode, key] = jb.dataset.job.split(":"); return addJob(mode, key); }
   const ch = e.target.closest("[data-changes]");
   if (ch) return openChanges(ch.dataset.changes);
+  const jd = e.target.closest("[data-jdismiss]");
+  if (jd) {
+    e.preventDefault();  // summary 안 버튼: 펼치기/접기 막기
+    const v = jd.dataset.jdismiss;
+    await postJson("/api/jobs/dismiss", v === "all" ? { all: true } : { id: Number(v) });
+    return pollJobs();
+  }
   const jr = e.target.closest("[data-jremove]");
   if (jr) return removeJob(Number(jr.dataset.jremove));
   const jchip = e.target.closest("[data-jstatus]");

@@ -15,6 +15,7 @@
                                work: 남은 수정 stash → 브랜치·구현·빌드·작업 기록 (커밋·푸시 없음)
                                analyze: 읽기 전용 분석 → data/analysis/<KEY>.md
 - POST /api/jobs/remove        {"id"} 대기열에서 빼기
+- POST /api/jobs/dismiss       {"id"} | {"all": true} 최근 결과에서 지우기
 - GET  /api/jobs               현재 작업(단계 포함) + 대기열 + 최근 결과
 - GET  /api/auto               자동 작업(지정 프로젝트) 상태
 - POST /api/auto               {"enabled"?, "dailyLimit"?, "project"?} 켜기/끄기 (켤 때 지금 있는 티켓은 제외 기준으로 기록)
@@ -986,6 +987,16 @@ def remove_job(job_id):
     return 404, {"error": "대기열에 없습니다 (이미 시작했을 수 있음)"}
 
 
+def dismiss_results(body):
+    """최근 결과에서 지우기 (id 하나 또는 전부). 작업 기록·변경 내용에는 영향 없음."""
+    with job_cv:
+        if body.get("all"):
+            job_history.clear()
+        else:
+            job_history[:] = [h for h in job_history if h.get("id") != body.get("id")]
+    return 200, {"ok": True}
+
+
 def jobs_status():
     with run_lock:
         return {"current": dict(work_state), "queue": list(job_queue), "history": job_history[::-1][:10]}
@@ -1613,6 +1624,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/auto/check":
             auto_check()
             return self.send(200, auto_public())
+        if self.path == "/api/jobs/dismiss":
+            return self.send(*dismiss_results(body))
         if self.path == "/api/jobs/remove":
             try:
                 return self.send(*remove_job(int(body.get("id"))))
